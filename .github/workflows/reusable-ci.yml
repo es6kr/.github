@@ -23,6 +23,11 @@ name: reusable-ci
         type: string
         required: false
         default: "Dockerfile"
+      platforms:
+        description: "Optional Buildx target platforms; empty keeps the existing native default"
+        type: string
+        required: false
+        default: ""
       image-name:
         description: "Target image name in GHCR (e.g. 'ghcr.io/es6kr/clawo-webhook')"
         type: string
@@ -42,6 +47,13 @@ name: reusable-ci
         type: number
         required: false
         default: 15
+    outputs:
+      image-digest:
+        description: "Buildx digest output, not independent registry acceptance"
+        value: ${{ jobs.build-and-push.outputs.image-digest }}
+      image-id:
+        description: "Buildx local image identifier, distinct from a registry subject"
+        value: ${{ jobs.build-and-push.outputs.image-id }}
     secrets:
       ghcr-token:
         description: "GitHub token for authenticating to GHCR (defaults to caller GITHUB_TOKEN)"
@@ -94,6 +106,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-id: ${{ steps.build.outputs.imageid }}
     steps:
       - name: Validate self-hosted runner route before checkout
         env:
@@ -135,10 +150,29 @@ jobs:
           driver: docker-container
 
       - name: Build and push container
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.docker-context }}
           file: ${{ inputs.docker-context }}/${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
           push: ${{ inputs.push-image || github.event_name == 'push' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Record build identifiers
+        if: inputs.platforms != '' && steps.build.outcome == 'success'
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_ID: ${{ steps.build.outputs.imageid }}
+          BUILD_RUN_ID: ${{ github.run_id }}
+          BUILD_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          source_commit="$(git rev-parse HEAD)"
+          [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ && "$BUILD_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          [[ -z "$IMAGE_ID" || "$IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ -z "$IMAGE_DIGEST" || "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'CI_BUILD_RECEIPT={"schema":1,"source_commit":"%s","run_id":"%s","run_attempt":"%s","image_id":"%s","builder_digest":"%s","oci_subject_kind":"unverified","registry_verified":false}\n' \
+            "$source_commit" "$BUILD_RUN_ID" "$BUILD_RUN_ATTEMPT" "$IMAGE_ID" "$IMAGE_DIGEST"
