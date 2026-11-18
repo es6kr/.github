@@ -53,8 +53,11 @@ jobs:
 #### Build identifiers
 
 `image-digest` forwards the builder's digest output; `image-id` forwards its local
-image identifier. They are distinct values. Neither independently proves a
-registry subject's media type, publication, signature or runtime acceptance.
+image identifier. These are separate fields, not a guarantee of different values.
+Consumers must allow equal values and empty fields when an output is omitted;
+neither case alone invalidates the receipt or establishes build failure.
+Neither identifier independently proves a registry subject's media type,
+publication, signature or runtime acceptance.
 Successful explicit-platform builds also emit `CI_BUILD_RECEIPT` with the actual
 checkout commit, run ID/attempt and both identifiers. OCI subject kind remains
 `unverified` and `registry_verified` remains false until independent read-back.
@@ -68,16 +71,22 @@ mapping use `oci-artifact-name: ${{ github.event_name == 'pull_request' && 'claw
 Do not add this input to the unchanged `@v1` compatibility example above.
 
 The prefix must contain only letters, digits, underscores, dots and hyphens,
-start with a letter or digit, and be at most 80 characters. Export goes to a
-new runner-owned temporary directory. The no-overwrite artifact contains only
+start with a letter or digit, and be at most 80 characters. Provide a distinct
+prefix for every workflow invocation, including each matrix call. The directory
+and artifact namespace is the prefix plus run ID and attempt; reusing that
+namespace must fail rather than replace another invocation's evidence.
+Export goes to a new runner-owned temporary directory. The no-overwrite artifact contains only
 `image.oci.tar` and `build-receipt.json`, is retained for three days and uses no
 artifact compression. The archive is limited to 2,000,000,000 bytes, leaving
 room within the approved 2 GiB download envelope for its wrapper and receipt.
 
 The receipt binds the actual checkout commit, run ID/attempt, builder outputs,
 archive SHA256 and byte size. An independent consumer must verify the exact
-run/head and archive hash before inspecting the OCI index, platform manifest
-and config digests. An uploaded archive is not registry publication, signature
+run ID and attempt, compare `source_commit` with the actual checkout commit for
+that attempt, and verify the archive hash before inspecting the OCI index,
+platform manifest and config digests. PR-head verification is a separate check;
+do not assume the PR branch head equals `source_commit`.
+An uploaded archive is not registry publication, signature
 verification, deployment or native skill-load acceptance. This option changes
 neither the existing push expression nor any runner route.
 
