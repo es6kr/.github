@@ -1,6 +1,8 @@
 import os
 import hashlib
 import json
+import csv
+import re
 from pathlib import Path
 import subprocess
 import yaml
@@ -120,10 +122,11 @@ def test_named_oci_export_is_prepared_before_the_builder(workflow_yaml):
     for value in ["pull_request", "PUSH_IMAGE", "OCI_ARTIFACT_NAME", "mkdir"]:
         assert value in prepare[0]["run"]
     output = build["with"].get("outputs", "")
-    assert "inputs.oci-artifact-name != ''" in output
-    assert "type=oci,dest=" in output and "image.oci.tar" in output
-    assert "runner.temp" in output and "github.run_attempt" in output
-    assert "|| ''" in output
+    identifier = prepare[0].get("id")
+    assert isinstance(identifier, str) and identifier, "OCI_EXPORT_OUTPUT_PRODUCER_MISSING"
+    assert output == "${{ steps." + identifier + ".outputs.build_output || '' }}"
+    assert "runner.temp" in prepare[0]["env"]["OCI_DIRECTORY"]
+    assert "github.run_attempt" in prepare[0]["env"]["OCI_DIRECTORY"]
     assert build["with"]["push"] == "${{ inputs.push-image || github.event_name == 'push' }}"
 
 
@@ -161,8 +164,9 @@ def run_workflow_shell(script, directory, **values):
     if os.name == "nt":
         # Git Bash needs its own executable paths; native Windows PATH is not shell PATH.
         env["PATH"] = "/mingw64/bin:/usr/bin:/bin"
-        if "OCI_DIRECTORY" in values:
-            values["OCI_DIRECTORY"] = Path(values["OCI_DIRECTORY"]).as_posix()
+        for key in ("OCI_DIRECTORY", "GITHUB_OUTPUT"):
+            if key in values:
+                values[key] = Path(values[key]).as_posix()
     env.update(GIT_NO_LAZY_FETCH="1", GIT_TERMINAL_PROMPT="0", **values)
     return subprocess.run([bash, "--noprofile", "--norc", "-c", script],
                           cwd=directory, env=env, capture_output=True, text=True, timeout=10)
@@ -173,7 +177,8 @@ def test_oci_preflight_recipe_preserves_existing_and_rejects_publishing(workflow
     prepare = next(s for s in steps if s.get("name") == "Prepare optional OCI export")
     target = tmp_path / "synthetic-export"
     values = {"OCI_ARTIFACT_NAME": "fixture-oci", "OCI_DIRECTORY": str(target),
-              "BUILD_EVENT": "pull_request", "PUSH_IMAGE": "false"}
+              "BUILD_EVENT": "pull_request", "PUSH_IMAGE": "false",
+              "GITHUB_OUTPUT": str(tmp_path / "github-output.txt")}
     allowed = run_workflow_shell(prepare["run"], tmp_path, **values)
     assert allowed.returncode == 0, allowed.stderr
     assert target.is_dir()
@@ -217,3 +222,56 @@ def test_oci_receipt_recipe_hashes_fixture_bytes_and_refuses_missing_export(work
     refused = run_workflow_shell(receipt["run"], root, **{**values, "OCI_DIRECTORY": str(missing)})
     assert refused.returncode != 0
     assert not (missing / "build-receipt.json").exists()
+
+
+@pytest.mark.parametrize("directory_name", ["runner", "runner,temp"])
+def test_oci_preflight_exports_csv_destination(workflow_yaml, tmp_path, directory_name):
+    """Exercise the actual prepare recipe, not GitHub's expression engine or Buildx."""
+    steps = workflow_yaml["jobs"]["build-and-push"]["steps"]
+    prepare = next(s for s in steps if s.get("name") == "Prepare optional OCI export")
+    directory = tmp_path / directory_name
+    output_file = tmp_path / "github-output.txt"
+    result = run_workflow_shell(
+        prepare["run"], tmp_path, OCI_ARTIFACT_NAME="fixture-oci",
+        OCI_DIRECTORY=directory.as_posix(), GITHUB_OUTPUT=output_file.as_posix(),
+        BUILD_EVENT="pull_request", PUSH_IMAGE="false",
+    )
+    assert result.returncode == 0, result.stderr
+    assert directory.is_dir()
+    assert output_file.is_file(), "OCI_EXPORT_OUTPUT_MISSING"
+    output_lines = output_file.read_text(encoding="utf-8").splitlines()
+    assert len(output_lines) == 1
+    key, value = output_lines[0].split("=", 1)
+    assert key == "build_output"
+    assert next(csv.reader([value])) == ["type=oci", f"dest={directory.as_posix()}/image.oci.tar"]
+
+
+@pytest.mark.parametrize("directory_name,allowed", [
+    ('runner,"quoted"', True),
+    ("runner\nrejected", False),
+    ("runner\rrejected", False),
+])
+def test_oci_csv_writer_quotes_fields_and_refuses_output_injection(
+    workflow_yaml, tmp_path, directory_name, allowed,
+):
+    """Use the real Bash writer alone: quotes/newlines are not Windows directory names."""
+    steps = workflow_yaml["jobs"]["build-and-push"]["steps"]
+    prepare = next(s for s in steps if s.get("name") == "Prepare optional OCI export")
+    writer = re.search(r"(?ms)^record_oci_export_output\(\) \{\n.*?^\}", prepare["run"])
+    assert writer is not None, "OCI_ENCODER_RECIPE_MISSING"
+    directory = (tmp_path / directory_name).as_posix()
+    output_file = tmp_path / "github-output.txt"
+    result = run_workflow_shell(
+        "set -euo pipefail\n" + writer.group(0) + "\nrecord_oci_export_output\n",
+        tmp_path, OCI_DIRECTORY=directory, GITHUB_OUTPUT=output_file.as_posix(),
+    )
+    if not allowed:
+        assert result.returncode != 0
+        assert not output_file.exists()
+        return
+    assert result.returncode == 0, result.stderr
+    output_lines = output_file.read_text(encoding="utf-8").splitlines()
+    assert len(output_lines) == 1
+    key, value = output_lines[0].split("=", 1)
+    assert key == "build_output"
+    assert next(csv.reader([value])) == ["type=oci", f"dest={directory}/image.oci.tar"]
