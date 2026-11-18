@@ -45,6 +45,7 @@ jobs:
 | `docker-context` | string | false | `"."` | Docker build context directory |
 | `dockerfile` | string | false | `"Dockerfile"` | Path to Dockerfile relative to context |
 | `platforms` | string | false | `""` | Optional Buildx target platforms, e.g. `linux/arm64`; empty preserves native selection |
+| `oci-artifact-name` | string | false | `""` | Opt-in PR-only OCI archive prefix; empty preserves existing exports |
 | `push-image` | boolean | false | `false` | Force push image (defaults to push on main/tags) |
 | `runner-label` | string | false | `"es6kr-local-linux"` | Target self-hosted runner label |
 | `timeout-minutes` | number | false | `15` | Timeout in minutes |
@@ -57,6 +58,28 @@ registry subject's media type, publication, signature or runtime acceptance.
 Successful explicit-platform builds also emit `CI_BUILD_RECEIPT` with the actual
 checkout commit, run ID/attempt and both identifiers. OCI subject kind remains
 `unverified` and `registry_verified` remains false until independent read-back.
+
+#### Optional nonpublishing OCI evidence
+
+Callers pinned to a reviewed commit supporting `oci-artifact-name` may request
+an OCI archive on pull requests with `push-image: false`. Leave the input empty
+on push events and for all legacy callers. For example, in the caller's `with`
+mapping use `oci-artifact-name: ${{ github.event_name == 'pull_request' && 'clawo-oci' || '' }}`.
+Do not add this input to the unchanged `@v1` compatibility example above.
+
+The prefix must contain only letters, digits, underscores, dots and hyphens,
+start with a letter or digit, and be at most 80 characters. Export goes to a
+new runner-owned temporary directory. The no-overwrite artifact contains only
+`image.oci.tar` and `build-receipt.json`, is retained for three days and uses no
+artifact compression. The archive is limited to 2,000,000,000 bytes, leaving
+room within the approved 2 GiB download envelope for its wrapper and receipt.
+
+The receipt binds the actual checkout commit, run ID/attempt, builder outputs,
+archive SHA256 and byte size. An independent consumer must verify the exact
+run/head and archive hash before inspecting the OCI index, platform manifest
+and config digests. An uploaded archive is not registry publication, signature
+verification, deployment or native skill-load acceptance. This option changes
+neither the existing push expression nor any runner route.
 
 #### Runner Routing & Security Policy
 

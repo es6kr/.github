@@ -1,4 +1,8 @@
 import os
+import hashlib
+import json
+from pathlib import Path
+import subprocess
 import yaml
 import pytest
 
@@ -145,3 +149,71 @@ def test_oci_archive_and_receipt_are_uploaded_without_overwrite(workflow_yaml):
         assert value in receipt["run"]
     assert '"oci_subject_kind":"unverified"' in receipt["run"]
     assert '"registry_verified":false' in receipt["run"]
+
+
+def run_workflow_shell(script, directory, **values):
+    """Exercise the actual shell recipe, never Buildx or a remote artifact API."""
+    bash = ("C:/Program Files/Git/usr/bin/bash.exe" if os.name == "nt" else "/bin/bash")
+    assert Path(bash).is_file(), "existing Bash runtime is required"
+    env = {key: os.environ[key] for key in (
+        "PATH", "SYSTEMROOT", "WINDIR", "HOME", "USERPROFILE", "TEMP", "TMP",
+    ) if key in os.environ}
+    if os.name == "nt":
+        # Git Bash needs its own executable paths; native Windows PATH is not shell PATH.
+        env["PATH"] = "/mingw64/bin:/usr/bin:/bin"
+        if "OCI_DIRECTORY" in values:
+            values["OCI_DIRECTORY"] = Path(values["OCI_DIRECTORY"]).as_posix()
+    env.update(GIT_NO_LAZY_FETCH="1", GIT_TERMINAL_PROMPT="0", **values)
+    return subprocess.run([bash, "--noprofile", "--norc", "-c", script],
+                          cwd=directory, env=env, capture_output=True, text=True, timeout=10)
+
+
+def test_oci_preflight_recipe_preserves_existing_and_rejects_publishing(workflow_yaml, tmp_path):
+    steps = workflow_yaml["jobs"]["build-and-push"]["steps"]
+    prepare = next(s for s in steps if s.get("name") == "Prepare optional OCI export")
+    target = tmp_path / "synthetic-export"
+    values = {"OCI_ARTIFACT_NAME": "fixture-oci", "OCI_DIRECTORY": str(target),
+              "BUILD_EVENT": "pull_request", "PUSH_IMAGE": "false"}
+    allowed = run_workflow_shell(prepare["run"], tmp_path, **values)
+    assert allowed.returncode == 0, allowed.stderr
+    assert target.is_dir()
+    marker = target / "preserve.txt"
+    marker.write_text("synthetic pre-existing bytes", encoding="utf-8")
+    before = marker.read_bytes()
+    assert run_workflow_shell(prepare["run"], tmp_path, **values).returncode != 0
+    assert marker.read_bytes() == before
+    for index, changes in enumerate((
+        {"OCI_ARTIFACT_NAME": "../escape"},
+        {"BUILD_EVENT": "push"},
+        {"PUSH_IMAGE": "true"},
+    )):
+        refused_target = tmp_path / ("refused-" + str(index))
+        actual = {**values, "OCI_DIRECTORY": str(refused_target), **changes}
+        refused = run_workflow_shell(prepare["run"], tmp_path, **actual)
+        assert refused.returncode != 0
+        assert not refused_target.exists()
+
+
+def test_oci_receipt_recipe_hashes_fixture_bytes_and_refuses_missing_export(workflow_yaml, tmp_path):
+    steps = workflow_yaml["jobs"]["build-and-push"]["steps"]
+    receipt = next(s for s in steps if s.get("name") == "Record build identifiers")
+    # A synthetic byte fixture exercises receipt transport, not OCI validity.
+    archive = tmp_path / "image.oci.tar"
+    payload = b"synthetic non-OCI receipt fixture\n"
+    archive.write_bytes(payload)
+    root = Path(WORKFLOW_PATH).resolve().parents[2]
+    values = {"OCI_ARTIFACT_NAME": "fixture-oci", "OCI_DIRECTORY": str(tmp_path),
+              "IMAGE_ID": "", "IMAGE_DIGEST": "", "BUILD_RUN_ID": "123", "BUILD_RUN_ATTEMPT": "1"}
+    accepted = run_workflow_shell(receipt["run"], root, **values)
+    assert accepted.returncode == 0, accepted.stderr
+    observed = json.loads((tmp_path / "build-receipt.json").read_text(encoding="utf-8"))
+    assert observed["archive_sha256"] == hashlib.sha256(payload).hexdigest()
+    assert observed["archive_bytes"] == len(payload)
+    assert observed["run_id"] == "123" and observed["run_attempt"] == "1"
+    assert observed["oci_subject_kind"] == "unverified"
+    assert observed["registry_verified"] is False
+    missing = tmp_path / "missing-export"
+    missing.mkdir()
+    refused = run_workflow_shell(receipt["run"], root, **{**values, "OCI_DIRECTORY": str(missing)})
+    assert refused.returncode != 0
+    assert not (missing / "build-receipt.json").exists()
