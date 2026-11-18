@@ -96,3 +96,52 @@ def test_explicit_platform_build_records_identifiers_without_claiming_registry_a
     assert "CI_BUILD_RECEIPT=" in receipt["run"]
     assert '"oci_subject_kind":"unverified"' in receipt["run"]
     assert '"registry_verified":false' in receipt["run"]
+
+
+def test_nonpublishing_oci_artifact_is_opt_in_with_compatible_default(workflow_yaml):
+    setting = workflow_yaml["on"]["workflow_call"]["inputs"].get("oci-artifact-name")
+    assert isinstance(setting, dict), "OCI_ARTIFACT_OPT_IN_MISSING"
+    assert setting["type"] == "string"
+    assert setting.get("required", False) is False
+    assert setting.get("default") == ""
+
+
+def test_named_oci_export_is_prepared_before_the_builder(workflow_yaml):
+    steps = workflow_yaml["jobs"]["build-and-push"]["steps"]
+    prepare = [s for s in steps if s.get("name") == "Prepare optional OCI export"]
+    assert len(prepare) == 1, "OCI_EXPORT_PREFLIGHT_MISSING"
+    build = next(s for s in steps if s.get("id") == "build")
+    assert steps.index(prepare[0]) < steps.index(build)
+    assert "inputs.oci-artifact-name != ''" in prepare[0]["if"]
+    for value in ["pull_request", "PUSH_IMAGE", "OCI_ARTIFACT_NAME", "mkdir"]:
+        assert value in prepare[0]["run"]
+    output = build["with"].get("outputs", "")
+    assert "inputs.oci-artifact-name != ''" in output
+    assert "type=oci,dest=" in output and "image.oci.tar" in output
+    assert "runner.temp" in output and "github.run_attempt" in output
+    assert "|| ''" in output
+    assert build["with"]["push"] == "${{ inputs.push-image || github.event_name == 'push' }}"
+
+
+def test_oci_archive_and_receipt_are_uploaded_without_overwrite(workflow_yaml):
+    steps = workflow_yaml["jobs"]["build-and-push"]["steps"]
+    uploads = [s for s in steps if s.get("name") == "Upload optional OCI build evidence"]
+    assert len(uploads) == 1, "OCI_ARCHIVE_UPLOAD_MISSING"
+    upload = uploads[0]
+    assert upload["uses"] == "actions/upload-artifact@v4"
+    assert "inputs.oci-artifact-name != ''" in upload["if"]
+    assert "steps.build.outcome == 'success'" in upload["if"]
+    assert upload["with"]["if-no-files-found"] == "error"
+    assert upload["with"]["overwrite"] is False
+    assert upload["with"]["compression-level"] == 0
+    assert upload["with"]["retention-days"] == 3
+    paths = upload["with"]["path"].splitlines()
+    assert len(paths) == 2
+    assert paths[0].endswith("/image.oci.tar")
+    assert paths[1].endswith("/build-receipt.json")
+    receipt = next(s for s in steps if s.get("name") == "Record build identifiers")
+    assert steps.index(receipt) < steps.index(upload)
+    for value in ["sha256sum", "archive_sha256", "archive_bytes", "2000000000", "build-receipt.json"]:
+        assert value in receipt["run"]
+    assert '"oci_subject_kind":"unverified"' in receipt["run"]
+    assert '"registry_verified":false' in receipt["run"]
