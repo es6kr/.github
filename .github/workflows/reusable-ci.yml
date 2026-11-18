@@ -23,6 +23,16 @@ name: reusable-ci
         type: string
         required: false
         default: "Dockerfile"
+      platforms:
+        description: "Optional Buildx target platforms; empty keeps the existing native default"
+        type: string
+        required: false
+        default: ""
+      oci-artifact-name:
+        description: "Caller-unique PR-only OCI prefix; matrix invocations need distinct names; empty preserves existing exports"
+        type: string
+        required: false
+        default: ""
       image-name:
         description: "Target image name in GHCR (e.g. 'ghcr.io/es6kr/clawo-webhook')"
         type: string
@@ -42,6 +52,13 @@ name: reusable-ci
         type: number
         required: false
         default: 15
+    outputs:
+      image-digest:
+        description: "Buildx digest output, not independent registry acceptance"
+        value: ${{ jobs.build-and-push.outputs.image-digest }}
+      image-id:
+        description: "Buildx local image identifier, distinct from a registry subject"
+        value: ${{ jobs.build-and-push.outputs.image-id }}
     secrets:
       ghcr-token:
         description: "GitHub token for authenticating to GHCR (defaults to caller GITHUB_TOKEN)"
@@ -94,6 +111,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-id: ${{ steps.build.outputs.imageid }}
     steps:
       - name: Validate self-hosted runner route before checkout
         env:
@@ -134,11 +154,87 @@ jobs:
         with:
           driver: docker-container
 
+      - name: Prepare optional OCI export
+        id: oci_export
+        if: inputs.oci-artifact-name != ''
+        env:
+          OCI_ARTIFACT_NAME: ${{ inputs.oci-artifact-name }}
+          OCI_DIRECTORY: ${{ runner.temp }}/${{ inputs.oci-artifact-name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          BUILD_EVENT: ${{ github.event_name }}
+          PUSH_IMAGE: ${{ inputs.push-image }}
+        run: |
+          set -euo pipefail
+          record_oci_export_output() {
+            local destination="$OCI_DIRECTORY/image.oci.tar"
+            # GUARD: a runner path must not inject another GITHUB_OUTPUT record.
+            if [[ "$destination" == *$'\n'* || "$destination" == *$'\r'* ]]; then
+              return 1
+            fi
+            destination="${destination//\"/\"\"}"
+            printf 'build_output=type=oci,"dest=%s"\n' "$destination" >> "$GITHUB_OUTPUT"
+          }
+          # GUARD: untrusted names must not escape runner-owned temporary storage.
+          [[ "$OCI_ARTIFACT_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$ ]]
+          [[ "$BUILD_EVENT" == "pull_request" && "$PUSH_IMAGE" == "false" ]]
+          umask 077
+          mkdir -- "$OCI_DIRECTORY"
+          record_oci_export_output
+
       - name: Build and push container
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.docker-context }}
           file: ${{ inputs.docker-context }}/${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          outputs: ${{ steps.oci_export.outputs.build_output || '' }}
           push: ${{ inputs.push-image || github.event_name == 'push' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Record build identifiers
+        if: (inputs.platforms != '' || inputs.oci-artifact-name != '') && steps.build.outcome == 'success'
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_ID: ${{ steps.build.outputs.imageid }}
+          BUILD_RUN_ID: ${{ github.run_id }}
+          BUILD_RUN_ATTEMPT: ${{ github.run_attempt }}
+          OCI_ARTIFACT_NAME: ${{ inputs.oci-artifact-name }}
+          OCI_DIRECTORY: ${{ runner.temp }}/${{ inputs.oci-artifact-name }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          source_commit="$(git rev-parse HEAD)"
+          [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ && "$BUILD_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          [[ -z "$IMAGE_ID" || "$IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ -z "$IMAGE_DIGEST" || "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          archive_sha256=""
+          archive_bytes=0
+          if [[ -n "$OCI_ARTIFACT_NAME" ]]; then
+            # GUARD: reject missing or oversized exports before uploading evidence.
+            [[ -f "$OCI_DIRECTORY/image.oci.tar" && ! -L "$OCI_DIRECTORY/image.oci.tar" ]]
+            archive_bytes="$(wc -c < "$OCI_DIRECTORY/image.oci.tar")"
+            [[ "$archive_bytes" -gt 0 && "$archive_bytes" -le 2000000000 ]]
+            archive_sha256="$(sha256sum "$OCI_DIRECTORY/image.oci.tar")"
+            archive_sha256="${archive_sha256%% *}"
+            [[ "$archive_sha256" =~ ^[0-9a-f]{64}$ ]]
+          fi
+          printf -v receipt '{"schema":1,"source_commit":"%s","run_id":"%s","run_attempt":"%s","image_id":"%s","builder_digest":"%s","archive_sha256":"%s","archive_bytes":%s,"oci_subject_kind":"unverified","registry_verified":false}' \
+            "$source_commit" "$BUILD_RUN_ID" "$BUILD_RUN_ATTEMPT" "$IMAGE_ID" "$IMAGE_DIGEST" "$archive_sha256" "$archive_bytes"
+          printf 'CI_BUILD_RECEIPT=%s\n' "$receipt"
+          if [[ -n "$OCI_ARTIFACT_NAME" ]]; then
+            printf '%s\n' "$receipt" > "$OCI_DIRECTORY/build-receipt.json"
+          fi
+
+      - name: Upload optional OCI build evidence
+        if: inputs.oci-artifact-name != '' && steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.oci-artifact-name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/${{ inputs.oci-artifact-name }}-${{ github.run_id }}-${{ github.run_attempt }}/image.oci.tar
+            ${{ runner.temp }}/${{ inputs.oci-artifact-name }}-${{ github.run_id }}-${{ github.run_attempt }}/build-receipt.json
+          if-no-files-found: error
+          overwrite: false
+          compression-level: 0
+          retention-days: 3
